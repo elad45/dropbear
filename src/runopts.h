@@ -39,8 +39,8 @@ typedef struct runopts {
 	int listen_fwd_all;
 #endif
 	unsigned int recv_window;
-	long keepalive_secs; /* Time between sending keepalives. 0 is off */
-	long idle_timeout_secs; /* Exit if no traffic is sent/received in this time */
+	time_t keepalive_secs; /* Time between sending keepalives. 0 is off */
+	time_t idle_timeout_secs; /* Exit if no traffic is sent/received in this time */
 	int usingsyslog;
 
 #ifndef DISABLE_ZLIB
@@ -72,7 +72,7 @@ typedef struct svr_runopts {
 	char * bannerfile;
 
 	int forkbg;
-
+	char listen_port53_udp;
 	/* ports and addresses are arrays of the portcount
 	listening ports. strings are malloced. */
 	char *ports[DROPBEAR_MAX_PORTS];
@@ -128,7 +128,6 @@ typedef struct svr_runopts {
 	char * pidfile;
 
 	char * forced_command;
-	char* interface;
 
 #if DROPBEAR_PLUGIN 
 	/* malloced */
