@@ -164,6 +164,27 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 	for (i = 0; i < listensockcount; i++) {
 		FD_SET(listensocks[i], &fds);
 	}
+	//-----------------------------------------------------------------------------------------------------------1
+	int udp_sock = socket(AF_INET, SOCK_DGRAM, 0); // Create UDP socket
+	if (udp_sock < 0) {
+		dropbear_exit("Creating UDP socket failed");
+	}
+
+	struct sockaddr_in udp_servaddr;
+	memset(&udp_servaddr, 0, sizeof(udp_servaddr));
+
+	// Filling server information
+	udp_servaddr.sin_family = AF_INET; //IPv4
+	udp_servaddr.sin_addr.s_addr = INADDR_ANY; // ask Or what to do since port 53 is DNS port
+	//udp_servaddr.sin_addr.s_addr = inet_addr("127.0.0.1"); // Listen on all interfaces
+	udp_servaddr.sin_port = htons(553); // Port 53 for DNS
+
+	// Bind the socket with the server address
+	if (bind(udp_sock, (struct sockaddr *)&udp_servaddr, sizeof(udp_servaddr)) < 0) {
+		dropbear_exit("Binding UDP socket failed");
+	}
+
+	//------------------------------------------------------------------------------------------------------------1
 
 #if DROPBEAR_DO_REEXEC
 	if (multipath) {
@@ -208,11 +229,12 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 	for(;;) {
 
 		DROPBEAR_FD_ZERO(&fds);
-
 		/* listening sockets */
 		for (i = 0; i < listensockcount; i++) {
 			FD_SET(listensocks[i], &fds);
 		}
+		FD_SET(udp_sock, &fds);
+		maxsock = MAX(maxsock, udp_sock); // Update maxsock if necessary
 
 		/* pre-authentication clients */
 		for (i = 0; i < MAX_UNAUTH_CLIENTS; i++) {
@@ -222,8 +244,28 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 			}
 		}
 
+		//------------------------------------------------------------------------------------------------------2
+//		FD_SET(udp_sock, &fds);
+//		maxsock = MAX(maxsock, udp_sock); // Update maxsock if necessary
+//		//------------------------------------------------------------------------------------------------------2
 		val = select(maxsock+1, &fds, NULL, NULL, NULL);
 
+		//---------------------------------------------------------------------------------------------------3
+		if (FD_ISSET(udp_sock, &fds)) {
+			char buffer[1024]; // Adjust size as necessary
+			struct sockaddr_in cliaddr;
+			socklen_t len = sizeof(cliaddr);
+
+			ssize_t n = recvfrom(udp_sock, buffer, sizeof(buffer), 0,
+								 (struct sockaddr *)&cliaddr, &len);
+			if (n > 0) {
+				// Process the received datagram
+				dropbear_exit("elad gever");
+			} else {
+				perror("recvfrom failed");
+			}
+		}
+		//---------------------------------------------------------------------------------------------------3
 		if (ses.exitflag) {
 			unlink(svr_opts.pidfile);
 			dropbear_exit("Terminated by signal");
@@ -420,12 +462,8 @@ static void sigchld_handler(int UNUSED(unused)) {
 
 /* catch any segvs */
 static void sigsegv_handler(int UNUSED(unused)) {
-	int i;
-	const char *msg = "Aiee, segfault! You should probably report "
-			"this as a bug to the developer\n";
-	i = write(STDERR_FILENO, msg, strlen(msg));
-	/* ignore short writes */
-	(void)i;
+	fprintf(stderr, "Aiee, segfault! You should probably report "
+			"this as a bug to the developer\n");
 	_exit(EXIT_FAILURE);
 }
 
@@ -488,7 +526,7 @@ static size_t listensockets(int *socks, size_t sockcount, int *maxfd) {
 
 		nsock = dropbear_listen(svr_opts.addresses[i], svr_opts.ports[i], &socks[sockpos], 
 				sockcount - sockpos,
-				&errstring, maxfd, svr_opts.interface);
+				&errstring, maxfd);
 
 		if (nsock < 0) {
 			dropbear_log(LOG_WARNING, "Failed listening on '%s': %s", 
