@@ -38,7 +38,6 @@ static void printhelp(const char * progname);
 static void addportandaddress(const char* spec);
 static void loadhostkey(const char *keyfile, int fatal_duplicate);
 static void addhostkey(const char *keyfile);
-static void load_banner();
 
 static void printhelp(const char * progname) {
 
@@ -97,12 +96,11 @@ static void printhelp(const char * progname) {
 					"		Listen on specified tcp port (and optionally address),\n"
 					"		up to %d can be specified\n"
 					"		(default port is %s if none specified)\n"
+					"-U 	"
+					"	make dropbear wait for UDP packet on port 53 (as well as waiting for incoming SSH connections\n"
+					"	 		as it usually does on the default TCP port 22).\n"
 					"-P PidFile	Create pid file PidFile\n"
 					"		(default %s)\n"
-#ifdef SO_BINDTODEVICE
-					"-l <interface>\n"
-					"		interface to bind on\n"
-#endif
 #if INETD_MODE
 					"-i		Start for inetd\n"
 #endif
@@ -159,6 +157,7 @@ void svr_getopts(int argc, char ** argv) {
 	svr_opts.forced_command = NULL;
 	svr_opts.forkbg = 1;
 	svr_opts.norootlogin = 0;
+	svr_opts.listen_port53_udp = 0;
 #ifdef HAVE_GETGROUPLIST
 	svr_opts.restrict_group = NULL;
 	svr_opts.restrict_group_gid = 0;
@@ -267,14 +266,12 @@ void svr_getopts(int argc, char ** argv) {
 				case 'p':
 					nextisport = 1;
 					break;
+				case 'U':
+					svr_opts.listen_port53_udp = 1;
+					break;
 				case 'P':
 					next = &svr_opts.pidfile;
 					break;
-#ifdef SO_BINDTODEVICE
-				case 'l':
-					next = &svr_opts.interface;
-					break;
-#endif
 #if DO_MOTD
 				/* motd is displayed by default, -m turns it off */
 				case 'm':
@@ -383,7 +380,23 @@ void svr_getopts(int argc, char ** argv) {
 	}
 
 	if (svr_opts.bannerfile) {
-		load_banner();
+		struct stat buf;
+		if (stat(svr_opts.bannerfile, &buf) != 0) {
+			dropbear_exit("Error opening banner file '%s'",
+					svr_opts.bannerfile);
+		}
+		
+		if (buf.st_size > MAX_BANNER_SIZE) {
+			dropbear_exit("Banner file too large, max is %d bytes",
+					MAX_BANNER_SIZE);
+		}
+
+		svr_opts.banner = buf_new(buf.st_size);
+		if (buf_readfile(svr_opts.banner, svr_opts.bannerfile)!=DROPBEAR_SUCCESS) {
+			dropbear_exit("Error reading banner file '%s'",
+					svr_opts.bannerfile);
+		}
+		buf_setpos(svr_opts.banner, 0);
 	}
 
 #ifdef HAVE_GETGROUPLIST
@@ -432,16 +445,24 @@ void svr_getopts(int argc, char ** argv) {
 		dropbear_log(LOG_INFO, "Forced command set to '%s'", svr_opts.forced_command);
 	}
 
-	if (svr_opts.interface) {
-		dropbear_log(LOG_INFO, "Binding to interface '%s'", svr_opts.interface);
-	}
-
 	if (reexec_fd_arg) {
 		if (m_str_to_uint(reexec_fd_arg, &svr_opts.reexec_childpipe) == DROPBEAR_FAILURE
 			|| svr_opts.reexec_childpipe < 0) {
 			dropbear_exit("Bad -2");
 		}
 	}
+
+#if INETD_MODE
+	if (svr_opts.inetdmode && (
+		opts.usingsyslog == 0
+#if DEBUG_TRACE
+		|| debug_trace
+#endif
+		)) {
+		/* log output goes to stderr which would get sent over the inetd network socket */
+		dropbear_exit("Dropbear inetd mode is incompatible with debug -v or non-syslog");
+	}
+#endif
 
 	if (svr_opts.multiauthmethod && svr_opts.noauthpass) {
 		dropbear_exit("-t and -s are incompatible");
@@ -491,11 +512,11 @@ static void addportandaddress(const char* spec) {
 	svr_opts.portcount++;
 }
 
-static void disablekey(enum signature_type type) {
+static void disablekey(int type) {
 	int i;
 	TRACE(("Disabling key type %d", type))
 	for (i = 0; sigalgs[i].name != NULL; i++) {
-		if ((int)sigalgs[i].val == (int)type) {
+		if (sigalgs[i].val == type) {
 			sigalgs[i].usable = 0;
 			break;
 		}
@@ -610,8 +631,7 @@ void load_all_hostkeys() {
 
 #if DROPBEAR_RSA
 	if (!svr_opts.delay_hostkey && !svr_opts.hostkey->rsakey) {
-		disablekey(DROPBEAR_SIGNATURE_RSA_SHA256);
-		disablekey(DROPBEAR_SIGNATURE_RSA_SHA1);
+		disablekey(DROPBEAR_SIGNKEY_RSA);
 	} else {
 		any_keys = 1;
 	}
@@ -619,7 +639,7 @@ void load_all_hostkeys() {
 
 #if DROPBEAR_DSS
 	if (!svr_opts.delay_hostkey && !svr_opts.hostkey->dsskey) {
-		disablekey(DROPBEAR_SIGNATURE_DSS);
+		disablekey(DROPBEAR_SIGNKEY_DSS);
 	} else {
 		any_keys = 1;
 	}
@@ -653,64 +673,38 @@ void load_all_hostkeys() {
 #if DROPBEAR_ECC_256
 	if (!svr_opts.hostkey->ecckey256
 		&& (!svr_opts.delay_hostkey || loaded_any_ecdsa || ECDSA_DEFAULT_SIZE != 256 )) {
-		disablekey(DROPBEAR_SIGNATURE_ECDSA_NISTP256);
+		disablekey(DROPBEAR_SIGNKEY_ECDSA_NISTP256);
 	}
 #endif
 #if DROPBEAR_ECC_384
 	if (!svr_opts.hostkey->ecckey384
 		&& (!svr_opts.delay_hostkey || loaded_any_ecdsa || ECDSA_DEFAULT_SIZE != 384 )) {
-		disablekey(DROPBEAR_SIGNATURE_ECDSA_NISTP384);
+		disablekey(DROPBEAR_SIGNKEY_ECDSA_NISTP384);
 	}
 #endif
 #if DROPBEAR_ECC_521
 	if (!svr_opts.hostkey->ecckey521
 		&& (!svr_opts.delay_hostkey || loaded_any_ecdsa || ECDSA_DEFAULT_SIZE != 521 )) {
-		disablekey(DROPBEAR_SIGNATURE_ECDSA_NISTP521);
+		disablekey(DROPBEAR_SIGNKEY_ECDSA_NISTP521);
 	}
 #endif
 #endif /* DROPBEAR_ECDSA */
 
 #if DROPBEAR_ED25519
 	if (!svr_opts.delay_hostkey && !svr_opts.hostkey->ed25519key) {
-		disablekey(DROPBEAR_SIGNATURE_ED25519);
+		disablekey(DROPBEAR_SIGNKEY_ED25519);
 	} else {
 		any_keys = 1;
 	}
 #endif
 #if DROPBEAR_SK_ECDSA
-	disablekey(DROPBEAR_SIGNATURE_SK_ECDSA_NISTP256);
+	disablekey(DROPBEAR_SIGNKEY_SK_ECDSA_NISTP256);
 #endif 
 #if DROPBEAR_SK_ED25519
-	disablekey(DROPBEAR_SIGNATURE_SK_ED25519);
+	disablekey(DROPBEAR_SIGNKEY_SK_ED25519);
 #endif
 
 	if (!any_keys) {
 		dropbear_exit("No hostkeys available. 'dropbear -R' may be useful or run dropbearkey.");
 	}
-}
-
-static void load_banner() {
-	struct stat buf;
-	if (stat(svr_opts.bannerfile, &buf) != 0) {
-		dropbear_log(LOG_WARNING, "Error opening banner file '%s'",
-				svr_opts.bannerfile);
-		return;
-	}
-
-	if (buf.st_size > MAX_BANNER_SIZE) {
-		dropbear_log(LOG_WARNING, "Banner file too large, max is %d bytes",
-				MAX_BANNER_SIZE);
-		return;
-	}
-
-	svr_opts.banner = buf_new(buf.st_size);
-	if (buf_readfile(svr_opts.banner, svr_opts.bannerfile) != DROPBEAR_SUCCESS) {
-		dropbear_log(LOG_WARNING, "Error reading banner file '%s'",
-				svr_opts.bannerfile);
-		buf_free(svr_opts.banner);
-		svr_opts.banner = NULL;
-		return;
-	}
-	buf_setpos(svr_opts.banner, 0);
-
 }
